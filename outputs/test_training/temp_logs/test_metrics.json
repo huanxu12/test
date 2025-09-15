@@ -1,0 +1,317 @@
+{
+  "best_metrics": {
+    "best_ate": 1.2,
+    "best_map": 0.65,
+    "best_val_loss": 0.55
+  },
+  "history": {
+    "train_losses": [
+      {
+        "epoch": 0,
+        "step": 10,
+        "timestamp": 1757900766.849352,
+        "losses": {
+          "pose": 0.1,
+          "detection": 0.5,
+          "gate": 0.02,
+          "total": 0.62
+        },
+        "fps": 15.5,
+        "gpu_memory_mb": 1024.0
+      }
+    ],
+    "val_losses": [
+      {
+        "epoch": 0,
+        "val_loss": 0.55,
+        "timestamp": 1757900766.849358
+      },
+      {
+        "epoch": 1,
+        "val_loss": 0.55,
+        "timestamp": 1757900766.8493922
+      },
+      {
+        "epoch": 2,
+        "val_loss": 0.551,
+        "timestamp": 1757900766.849396
+      },
+      {
+        "epoch": 3,
+        "val_loss": 0.552,
+        "timestamp": 1757900766.8493984
+      },
+      {
+        "epoch": 4,
+        "val_loss": 0.553,
+        "timestamp": 1757900766.8493998
+      },
+      {
+        "epoch": 5,
+        "val_loss": 0.554,
+        "timestamp": 1757900766.8494022
+      },
+      {
+        "epoch": 6,
+        "val_loss": 0.555,
+        "timestamp": 1757900766.8494036
+      },
+      {
+        "epoch": 7,
+        "val_loss": 0.556,
+        "timestamp": 1757900766.8494048
+      },
+      {
+        "epoch": 8,
+        "val_loss": 0.557,
+        "timestamp": 1757900766.849406
+      },
+      {
+        "epoch": 9,
+        "val_loss": 0.558,
+        "timestamp": 1757900766.8494177
+      },
+      {
+        "epoch": 10,
+        "val_loss": 0.559,
+        "timestamp": 1757900766.8494194
+      },
+      {
+        "epoch": 11,
+        "val_loss": 0.56,
+        "timestamp": 1757900766.849421
+      },
+      {
+        "epoch": 12,
+        "val_loss": 0.561,
+        "timestamp": 1757900766.849424
+      },
+      {
+        "epoch": 13,
+        "val_loss": 0.562,
+        "timestamp": 1757900766.8494267
+      },
+      {
+        "epoch": 14,
+        "val_loss": 0.5630000000000001,
+        "timestamp": 1757900766.8494296
+      },
+      {
+        "epoch": 15,
+        "val_loss": 0.5640000000000001,
+        "timestamp": 1757900766.849432
+      }
+    ],
+    "ate_errors": [
+      {
+        "epoch": 0,
+        "ate": 1.2
+      },
+      {
+        "epoch": 1,
+        "ate": 1.2
+      },
+      {
+        "epoch": 2,
+        "ate": 1.21
+      },
+      {
+        "epoch": 3,
+        "ate": 1.22
+      },
+      {
+        "epoch": 4,
+        "ate": 1.23
+      },
+      {
+        "epoch": 5,
+        "ate": 1.24
+      },
+      {
+        "epoch": 6,
+        "ate": 1.25
+      },
+      {
+        "epoch": 7,
+        "ate": 1.26
+      },
+      {
+        "epoch": 8,
+        "ate": 1.27
+      },
+      {
+        "epoch": 9,
+        "ate": 1.28
+      },
+      {
+        "epoch": 10,
+        "ate": 1.29
+      },
+      {
+        "epoch": 11,
+        "ate": 1.3
+      },
+      {
+        "epoch": 12,
+        "ate": 1.31
+      },
+      {
+        "epoch": 13,
+        "ate": 1.3199999999999998
+      },
+      {
+        "epoch": 14,
+        "ate": 1.33
+      },
+      {
+        "epoch": 15,
+        "ate": 1.3399999999999999
+      }
+    ],
+    "rpe_errors": [
+      {
+        "epoch": 0,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 1,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 2,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 3,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 4,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 5,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 6,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 7,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 8,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 9,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 10,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 11,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 12,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 13,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 14,
+        "rpe": 0.8
+      },
+      {
+        "epoch": 15,
+        "rpe": 0.8
+      }
+    ],
+    "map_scores": [
+      {
+        "epoch": 0,
+        "map": 0.65
+      },
+      {
+        "epoch": 1,
+        "map": 0.65
+      },
+      {
+        "epoch": 2,
+        "map": 0.65
+      },
+      {
+        "epoch": 3,
+        "map": 0.65
+      },
+      {
+        "epoch": 4,
+        "map": 0.65
+      },
+      {
+        "epoch": 5,
+        "map": 0.65
+      },
+      {
+        "epoch": 6,
+        "map": 0.65
+      },
+      {
+        "epoch": 7,
+        "map": 0.65
+      },
+      {
+        "epoch": 8,
+        "map": 0.65
+      },
+      {
+        "epoch": 9,
+        "map": 0.65
+      },
+      {
+        "epoch": 10,
+        "map": 0.65
+      },
+      {
+        "epoch": 11,
+        "map": 0.65
+      },
+      {
+        "epoch": 12,
+        "map": 0.65
+      },
+      {
+        "epoch": 13,
+        "map": 0.65
+      },
+      {
+        "epoch": 14,
+        "map": 0.65
+      },
+      {
+        "epoch": 15,
+        "map": 0.65
+      }
+    ],
+    "fps_values": [],
+    "kendall_weights": [
+      {
+        "epoch": 0,
+        "step": 10,
+        "weights": {
+          "pose_weight": 1.0,
+          "detection_weight": 0.8,
+          "gate_weight": 2.0
+        }
+      }
+    ],
+    "gpu_memory": []
+  }
+}

@@ -1,0 +1,177 @@
+# MineSLAM Configuration - REAL DATA ONLY
+# This configuration STRICTLY prohibits synthetic/random data usage
+
+# Project paths (MUST point to real data directories)
+project:
+  name: "MineSLAM"
+  version: "1.0.0"
+  root: "/root/autodl-tmp/new huanjing ganzhi-cc"
+
+# Real data paths - ALL MUST EXIST
+data:
+  root: "/root/autodl-tmp/new huanjing ganzhi-cc/data"
+  train_index: "/root/autodl-tmp/new huanjing ganzhi-cc/lists/train.jsonl"
+  val_index: "/root/autodl-tmp/new huanjing ganzhi-cc/lists/val.jsonl"
+  test_index: "/root/autodl-tmp/new huanjing ganzhi-cc/lists/test.jsonl"
+  
+  # Source data directory (existing dataset)
+  source_data: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning"
+  
+  # Real sensor data paths
+  images:
+    thermal: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/images/boson_thermal"
+    rgb_left: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/images/multisense_left_color"
+    rgb_right: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/images/multisense_right"
+    depth: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/images/multisense_depth"
+  
+  pointclouds:
+    multisense: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/pointclouds/multisense_lidar"
+    ouster: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/pointclouds/ouster_lidar"
+    assembled: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/pointclouds/assembled_cloud"
+  
+  imu: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/imu"
+  odometry: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/odometry"
+
+  # Test configuration specific paths (needed by test_encoders.py)
+  lidar_dir: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/pointclouds/assembled_cloud"
+  imu_file: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/imu/main_imu.csv"
+  
+  # Ground truth data
+  ground_truth:
+    trajectory: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/ground_truth_trajectory.csv"
+    stats: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/ground_truth_stats.json"
+    artifacts: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/sr_B_route2.bag.artifacts"
+    fiducials: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/fiducial_sr"
+
+# Calibration data paths - MUST point to real calibration files
+calib:
+  extrinsics: "/root/autodl-tmp/new huanjing ganzhi-cc/calib/extrinsics.yaml"
+  intrinsics: "/root/autodl-tmp/new huanjing ganzhi-cc/calib/intrinsics.yaml"
+  source_calibration: "/root/autodl-tmp/new huanjing ganzhi-cc/sr_B_route2_deep_learning/calibration/calibration_data.json"
+
+# Model architecture
+model:
+  name: "MineSLAM"
+  
+  # Multi-modal encoders
+  encoders:
+    rgb:
+      backbone: "efficientnet-b0"
+      feature_dim: 512
+      input_size: [544, 1024]  # H, W from real camera specs
+    
+    thermal:
+      backbone: "efficientnet-b0"
+      feature_dim: 512
+      input_size: [512, 640]   # H, W from FLIR Boson specs
+    
+    depth:
+      backbone: "efficientnet-b0"
+      feature_dim: 512
+      input_size: [544, 1024]  # H, W from stereo specs
+    
+    lidar:
+      backbone: "MinkowskiUNet14"
+      feature_dim: 512
+      voxel_size: 0.05
+      max_points: 200000
+    
+    imu:
+      hidden_dim: 256
+      num_layers: 2
+      window_size: 20
+      feature_dim: 512
+
+  # Mixture of Experts fusion
+  fusion:
+    num_experts: 3
+    expert_dim: 512
+    gate_dim: 256
+    dropout: 0.1
+
+  # Task heads
+  heads:
+    pose:
+      hidden_dim: 256
+      output_dim: 6  # se(3) motion increment
+    
+    detection:
+      num_queries: 20
+      num_classes: 8  # Based on real artifacts: fiducial, extinguisher, phone, backpack, survivor, drill, etc.
+      hidden_dim: 256
+
+# Training configuration
+training:
+  batch_size: 4
+  num_epochs: 100
+  learning_rate: 1e-4
+  weight_decay: 1e-5
+  
+  # Loss weights
+  loss_weights:
+    pose: 1.0
+    detection: 1.0
+    gate: 0.1
+  
+  # Data augmentation (applied to REAL data only)
+  augmentation:
+    rgb:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+    
+    pointcloud:
+      noise_std: 0.01
+      dropout_ratio: 0.1
+    
+    temporal:
+      jitter_ratio: 0.05
+
+# Validation configuration
+validation:
+  batch_size: 2
+  eval_every: 5  # epochs
+  save_best: true
+
+# Hardware configuration
+hardware:
+  device: "cuda"
+  num_workers: 4
+  pin_memory: true
+  mixed_precision: true
+
+# Metrics configuration
+metrics:
+  pose:
+    - "ATE"  # Absolute Trajectory Error
+    - "RPE"  # Relative Pose Error
+  
+  detection:
+    - "mAP_3D"  # 3D mean Average Precision
+    - "mAP@0.5"
+    - "mAP@0.7"
+  
+  system:
+    - "FPS"  # Frames Per Second
+    - "GPU_Memory"
+    - "Inference_Time"
+
+# Logging configuration
+logging:
+  level: "INFO"
+  log_dir: "/root/autodl-tmp/new huanjing ganzhi-cc/logs"
+  tensorboard_dir: "/root/autodl-tmp/new huanjing ganzhi-cc/runs"
+  save_interval: 10  # epochs
+
+# Checkpoint configuration
+checkpoint:
+  save_dir: "/root/autodl-tmp/new huanjing ganzhi-cc/checkpoints"
+  save_every: 5  # epochs
+  keep_last: 5
+
+# Real data validation settings
+validation_settings:
+  min_samples_test: 5  # Minimum real samples for bootstrap test
+  strict_path_check: true  # Fail if any path doesn't exist
+  allow_synthetic: false   # NEVER allow synthetic/random data
+  allow_mock: false       # NEVER allow mock data

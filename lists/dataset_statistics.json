@@ -1,0 +1,32 @@
+{
+  "total_samples": 14790,
+  "time_range": {
+    "start": 1566245557.0,
+    "end": 1566247036.0,
+    "duration": 1479.0
+  },
+  "modality_coverage": {
+    "thermal_image": {
+      "count": 14790,
+      "coverage": 100.0
+    },
+    "rgb_image": {
+      "count": 10537,
+      "coverage": 71.24408384043272
+    },
+    "depth_image": {
+      "count": 0,
+      "coverage": 0.0
+    },
+    "lidar_file": {
+      "count": 14450,
+      "coverage": 97.70114942528735
+    },
+    "pose": {
+      "count": 14782,
+      "coverage": 99.94590939824205
+    }
+  },
+  "temporal_alignment_threshold_ms": 50,
+  "data_source": "sr_B_route2_deep_learning"
+}
