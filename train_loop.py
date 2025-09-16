@@ -15,12 +15,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+try:
+    # 新版本PyTorch (≥1.10)
+    from torch.amp import autocast
+except ImportError:
+    # 旧版本PyTorch
+    from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader, Subset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# Add project root to path
+# 添加项目根目录到路径
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
@@ -30,51 +36,152 @@ from models.encoders import MultiModalEncoder
 from models.moe_fusion import MoEFusion, MoEConfig
 from models.pose_head import PoseHead
 from models.detection_head import DetectionHead
-from models.kendall_uncertainty import create_kendall_uncertainty
+from models.kendall_uncertainty import create_fixed_kendall_uncertainty
 from matcher import HungarianMatcher, TargetGenerator
+
+# 集成评估和可视化系统
+try:
+    from slam_evaluator import MineSLAMEvaluator, SLAMTrajectoryMetrics
+    from slam_visualizer import SLAMVisualizer, TrainingMonitor
+    SLAM_INTEGRATION_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ SLAM integration partially unavailable: {e}")
+    SLAM_INTEGRATION_AVAILABLE = False
+
+# 抑制重复警告 - 路线B优化
+warnings.filterwarnings("ignore", message="coordinates implicitly converted to torch.IntTensor")
+warnings.filterwarnings("ignore", message="`torch.cuda.amp.autocast.*` is deprecated")
+
+# 全局计数器，用于限制某些警告显示
+_warning_counters = {
+    'minkowski_coords': 0,
+    'autocast_deprecated': 0,
+    'missing_modality': 0
+}
 
 
 def pointcloud_collate_fn(batch):
     """
-    自定义批处理函数，处理不同尺寸的点云数据
+    路线B：柔性批处理函数，强制对齐batch_size，零填充+掩码
+
+    核心原则：
+    1. 不丢样本，所有模态强制对齐相同batch_size B
+    2. 缺失模态用零样本占位
+    3. 返回present_mask指示真实/填充数据
+    4. 禁止filter(None)
+    5. 点云统一到固定长度P，图像统一尺寸
 
     Args:
         batch: 样本列表，每个样本是一个字典
 
     Returns:
-        collated_batch: 批处理后的字典，点云数据保持列表形式
+        collated_batch: 批处理后的字典，包含：
+        - 各模态数据：统一batch_size的张量
+        - present_mask：指示真实/填充数据的掩码字典
     """
     if not batch:
         return {}
 
+    batch_size = len(batch)
     collated_batch = {}
+    present_mask = {}
+
+    # 固定参数 - 路线B要求
+    FIXED_LIDAR_SIZE = 16384  # P参数：点云统一长度
 
     for key in batch[0].keys():
+        # 确定哪些样本有此模态的数据
+        valid_indices = [i for i, item in enumerate(batch) if key in item]
+
+        # 创建present_mask - 路线B格式
+        mask = torch.zeros(batch_size, dtype=torch.bool)
+        mask[valid_indices] = True
+        present_mask[key] = mask
+
         if key == 'lidar':
-            # 点云数据特殊处理 - 保持列表形式避免形状不匹配
-            collated_batch[key] = [item[key] for item in batch]
+            # 点云：统一到固定长度P，强制对齐batch_size B
+            standardized_lidar = []
+            for i in range(batch_size):
+                if i in valid_indices:
+                    # 真实点云：统一到固定长度
+                    points = batch[i][key]
+                    uniform_points = pad_or_subsample_pointcloud(points, target_size=FIXED_LIDAR_SIZE)
+                    standardized_lidar.append(uniform_points)
+                else:
+                    # 填充点云：固定长度的零点云
+                    dummy_lidar = torch.zeros(FIXED_LIDAR_SIZE, 4, dtype=torch.float32)
+                    standardized_lidar.append(dummy_lidar)
+
+            collated_batch[key] = torch.stack(standardized_lidar)  # [B, P, C]
+
         elif key in ['rgb', 'depth', 'thermal']:
-            # 图像数据正常批处理
-            try:
-                collated_batch[key] = torch.stack([item[key] for item in batch])
-            except RuntimeError as e:
-                # 如果图像尺寸不匹配，输出警告并保持列表形式
-                print(f"Warning: Cannot stack {key} tensors: {e}")
-                collated_batch[key] = [item[key] for item in batch]
+            # 图像数据：强制对齐batch_size B
+            if valid_indices:
+                # 获取参考尺寸（应在dataset中预处理为统一尺寸）
+                ref_shape = batch[valid_indices[0]][key].shape
+                standardized_images = []
+
+                for i in range(batch_size):
+                    if i in valid_indices:
+                        # 真实图像
+                        standardized_images.append(batch[i][key])
+                    else:
+                        # 填充图像：相同尺寸的零图像
+                        dummy_image = torch.zeros(ref_shape, dtype=torch.float32)
+                        standardized_images.append(dummy_image)
+
+                collated_batch[key] = torch.stack(standardized_images)  # [B, C, H, W]
+            else:
+                # 所有样本都缺失此模态（不应发生）
+                collated_batch[key] = []
+
         elif key == 'imu':
-            # IMU序列数据处理
-            try:
-                collated_batch[key] = torch.stack([item[key] for item in batch])
-            except RuntimeError:
-                # IMU序列长度不同时保持列表形式
-                collated_batch[key] = [item[key] for item in batch]
+            # IMU序列数据：强制对齐batch_size B
+            if valid_indices:
+                ref_shape = batch[valid_indices[0]][key].shape
+                standardized_imu = []
+
+                for i in range(batch_size):
+                    if i in valid_indices:
+                        # 真实IMU序列
+                        standardized_imu.append(batch[i][key])
+                    else:
+                        # 填充IMU序列：相同长度的零序列
+                        dummy_imu = torch.zeros(ref_shape, dtype=torch.float32)
+                        standardized_imu.append(dummy_imu)
+
+                collated_batch[key] = torch.stack(standardized_imu)  # [B, T, 6]
+            else:
+                collated_batch[key] = []
+
         else:
-            # 其他数据（pose_delta, boxes等）正常批处理
-            try:
-                collated_batch[key] = torch.stack([item[key] for item in batch])
-            except (RuntimeError, ValueError):
-                # 无法stack时保持列表形式
-                collated_batch[key] = [item[key] for item in batch]
+            # 其他数据（pose_delta, boxes等）：强制对齐batch_size B
+            if valid_indices:
+                ref_item = batch[valid_indices[0]][key]
+                standardized_items = []
+
+                for i in range(batch_size):
+                    if i in valid_indices:
+                        # 真实数据
+                        standardized_items.append(batch[i][key])
+                    else:
+                        # 填充数据：根据类型创建默认值
+                        if hasattr(ref_item, 'shape'):
+                            dummy_item = torch.zeros_like(ref_item)
+                        else:
+                            dummy_item = torch.tensor(0.0)  # 标量默认值
+                        standardized_items.append(dummy_item)
+
+                try:
+                    collated_batch[key] = torch.stack(standardized_items)
+                except:
+                    # 无法stack时保持列表形式
+                    collated_batch[key] = standardized_items
+            else:
+                collated_batch[key] = []
+
+    # 添加present_mask到批次数据 - 路线B格式
+    collated_batch['present_mask'] = present_mask
 
     return collated_batch
 
@@ -156,14 +263,15 @@ class RealDataValidator:
                                     f"in batch {batch_idx}")
 
 
-class TrainingMetrics:
-    """训练指标管理器"""
+class EnhancedTrainingMetrics:
+    """增强的训练指标管理器 - 集成SLAM评估"""
 
-    def __init__(self, log_dir: str):
+    def __init__(self, log_dir: str, config: Dict):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.config = config
 
-        # 指标历史
+        # 原有指标历史
         self.metrics_history = {
             'train_losses': [],
             'val_losses': [],
@@ -175,15 +283,34 @@ class TrainingMetrics:
             'gpu_memory': []
         }
 
+        # 新增SLAM详细指标
+        self.slam_metrics_history = {
+            'trajectory_metrics': [],      # 轨迹详细分析
+            'detection_metrics': [],       # 检测详细分析
+            'fusion_metrics': [],          # 多模态融合分析
+            'uncertainty_metrics': []      # 不确定性分析
+        }
+
         # 最佳指标记录
         self.best_ate = float('inf')
         self.best_map = 0.0
         self.best_val_loss = float('inf')
 
+        # 集成SLAM评估器
+        if SLAM_INTEGRATION_AVAILABLE:
+            self.slam_evaluator = MineSLAMEvaluator(config)
+            self.trajectory_metrics = SLAMTrajectoryMetrics()
+            # 使用简化的检测指标
+            self.detection_metrics = DetectionMetrics()  # 从原有metrics模块导入
+        else:
+            self.slam_evaluator = None
+            self.trajectory_metrics = None
+            self.detection_metrics = None
+
     def update_train_metrics(self, losses: Dict[str, float],
                            kendall_weights: Dict[str, float],
                            gpu_memory: float, fps: float, epoch: int, step: int):
-        """更新训练指标"""
+        """更新训练指标（保持原有接口）"""
         self.metrics_history['train_losses'].append({
             'epoch': epoch,
             'step': step,
@@ -199,9 +326,63 @@ class TrainingMetrics:
             'weights': kendall_weights
         })
 
+    def update_slam_metrics(self, epoch: int, model_outputs: Dict,
+                           ground_truth: Dict, batch_data: Dict):
+        """更新完整的SLAM评估指标"""
+        if not SLAM_INTEGRATION_AVAILABLE:
+            return
+
+        try:
+            # 轨迹评估
+            if 'pose' in model_outputs and 'pose' in ground_truth and self.trajectory_metrics:
+                traj_metrics = self.trajectory_metrics.compute_detailed_metrics(
+                    model_outputs['pose'], ground_truth['pose']
+                )
+                self.slam_metrics_history['trajectory_metrics'].append({
+                    'epoch': epoch,
+                    'timestamp': time.time(),
+                    'metrics': traj_metrics
+                })
+
+            # 检测评估
+            if 'detection' in model_outputs and 'detection' in ground_truth and self.detection_metrics:
+                det_metrics = self.detection_metrics.compute()  # 使用简化接口
+                self.slam_metrics_history['detection_metrics'].append({
+                    'epoch': epoch,
+                    'timestamp': time.time(),
+                    'metrics': det_metrics
+                })
+
+            # MoE融合分析
+            if 'moe_analysis' in model_outputs:
+                fusion_analysis = self._analyze_moe_fusion(model_outputs['moe_analysis'])
+                self.slam_metrics_history['fusion_metrics'].append({
+                    'epoch': epoch,
+                    'timestamp': time.time(),
+                    'analysis': fusion_analysis
+                })
+
+        except Exception as e:
+            warnings.warn(f"SLAM metrics update failed: {e}")
+
+    def _analyze_moe_fusion(self, moe_output: Dict) -> Dict:
+        """分析MoE融合效果"""
+        analysis = {}
+
+        if 'gate_weights' in moe_output:
+            gate_weights = moe_output['gate_weights']
+            analysis['expert_utilization'] = {
+                f'expert_{i}': float(gate_weights[:, i].mean())
+                for i in range(gate_weights.shape[1])
+            }
+            analysis['gate_entropy'] = float(moe_output.get('entropy_loss', 0))
+            analysis['load_balance'] = float(gate_weights.std())
+
+        return analysis
+
     def update_val_metrics(self, val_loss: float, ate: float,
                           rpe: float, map_score: float, epoch: int):
-        """更新验证指标"""
+        """更新验证指标（保持原有接口）"""
         self.metrics_history['val_losses'].append({
             'epoch': epoch,
             'val_loss': val_loss,
@@ -233,38 +414,38 @@ class TrainingMetrics:
         if val_loss < self.best_val_loss:
             self.best_val_loss = val_loss
 
-    def save_metrics(self, filename: str = 'training_metrics.json'):
-        """保存指标到文件"""
+    def save_enhanced_metrics(self, filename: str = 'enhanced_training_metrics.json'):
+        """保存增强指标到文件"""
         metrics_path = self.log_dir / filename
 
-        # 添加最佳指标
+        # 合并所有指标
         output_data = {
             'best_metrics': {
                 'best_ate': self.best_ate,
                 'best_map': self.best_map,
                 'best_val_loss': self.best_val_loss
             },
-            'history': self.metrics_history
+            'basic_history': self.metrics_history,
+            'slam_history': self.slam_metrics_history,
+            'config': self.config
         }
 
         with open(metrics_path, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
+            json.dump(output_data, f, indent=2, ensure_ascii=False, default=str)
 
         return metrics_path
 
     def should_early_stop(self, patience: int = 10, min_delta: float = 1e-4) -> bool:
-        """判断是否应该早停"""
+        """判断是否应该早停（保持原有接口）"""
         if len(self.metrics_history['val_losses']) < patience:
             return False
 
-        # 检查最近patience个epoch的验证损失是否没有显著改善
         recent_losses = [item['val_loss'] for item in
                         self.metrics_history['val_losses'][-patience:]]
 
         if len(recent_losses) < patience:
             return False
 
-        # 如果最近的损失都没有比最好的损失改善min_delta以上，则早停
         best_recent = min(recent_losses)
         return (self.best_val_loss - best_recent) < min_delta
 
@@ -303,12 +484,29 @@ class MineSLAMTrainer:
         self._setup_training_components()
         self._setup_data_loaders()
 
-        # 验证器和指标管理
+        # 集成增强的验证器和指标管理
         self.data_validator = RealDataValidator()
-        self.metrics = TrainingMetrics(str(self.output_dir / 'logs'))
+        self.metrics = EnhancedTrainingMetrics(str(self.output_dir / 'logs'), config)
 
-        print(f"MineSLAMTrainer initialized: {self.batch_size}×{self.accumulation_steps} effective batch")
+        # 集成可视化系统
+        if SLAM_INTEGRATION_AVAILABLE:
+            self.visualizer = SLAMVisualizer(config, output_dir=str(self.output_dir / 'visualizations'))
+            self.training_monitor = TrainingMonitor(
+                log_dir=str(self.output_dir / 'logs'),
+                update_interval=50  # 每50个batch更新一次
+            )
+        else:
+            self.visualizer = None
+            self.training_monitor = None
+
+        print(f"MineSLAMTrainer initialized: {self.batch_size}×{self.accumulation_steps} effective batch (Route B)")
         print(f"Targets: ATE≤{self.target_ate}m, mAP≥{self.target_map*100}%")
+        print(f"Route B features: Masked padding, consistent batch_size, no sample dropping")
+        if SLAM_INTEGRATION_AVAILABLE:
+            print(f"🎨 Integrated: SLAM Evaluator + Real-time Visualizer + Training Monitor")
+        else:
+            print(f"⚠️ Basic training mode: SLAM integration unavailable")
+        print(f"Warning suppression: MinkowskiEngine + deprecated autocast warnings filtered")
 
     def _setup_models(self):
         """设置模型组件"""
@@ -348,13 +546,18 @@ class MineSLAMTrainer:
 
     def _setup_training_components(self):
         """设置训练组件"""
-        # Kendall不确定性权重学习
-        self.kendall_uncertainty = create_kendall_uncertainty(
-            uncertainty_type='adaptive',
-            num_tasks=3,
-            init_log_var=0.0,
-            adaptation_rate=0.01
-        ).to(self.device)
+        # 修复版Kendall不确定性权重学习 - 解决权重失衡问题
+        self.kendall_uncertainty = create_fixed_kendall_uncertainty({
+            'initial_pose_log_var': -1.0,      # σ≈0.61, weight≈2.7
+            'initial_detection_log_var': 0.0,   # σ=1.0,  weight=1.0
+            'initial_gate_log_var': -0.4,      # σ≈0.82, weight≈1.5
+            'enable_weight_constraints': True,
+            'min_log_var': -2.0,
+            'max_log_var': 2.0,
+            'learning_rate_scale': 0.1
+        }).to(self.device)
+
+        print("🔧 使用修复版Kendall不确定性 - 目标权重比例 2.7:1.0:1.5")
 
         # 优化器 - 包含所有参数
         all_params = []
@@ -380,9 +583,9 @@ class MineSLAMTrainer:
             eta_min=self.learning_rate * 0.01
         )
 
-        # 自动混合精度
+        # 自动混合精度 - 禁用以兼容MinkowskiEngine
         self.scaler = GradScaler()
-        self.use_amp = self.config.get('use_amp', True)
+        self.use_amp = False  # 禁用AMP避免MinkowskiEngine FP16兼容性问题
 
         # 匹配器
         self.matcher = HungarianMatcher(
@@ -392,7 +595,7 @@ class MineSLAMTrainer:
         )
         self.target_generator = TargetGenerator()
 
-        print(f"Training components setup: AMP={self.use_amp}, "
+        print(f"Training components setup: AMP={self.use_amp} (DISABLED for MinkowskiEngine compatibility), "
               f"Accumulation={self.accumulation_steps}, Warmup={warmup_steps}")
 
     def _setup_data_loaders(self):
@@ -511,6 +714,15 @@ class MineSLAMTrainer:
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """训练一个epoch"""
+        # 添加额外的警告过滤
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="MinkowskiEngine")
+            warnings.filterwarnings("ignore", category=FutureWarning, message=".*autocast.*")
+
+            return self._train_epoch_impl(epoch)
+
+    def _train_epoch_impl(self, epoch: int) -> Dict[str, float]:
+        """训练一个epoch的实际实现"""
         self.encoder.train()
         self.moe_fusion.train()
         self.pose_head.train()
@@ -533,38 +745,40 @@ class MineSLAMTrainer:
             # 学习率预热
             self._warmup_lr(global_step, 1000)
 
-            # 构建输入
+            # 构建输入 - 路线B：直接使用collate的统一输出
+            # 不需要额外处理，collate已经保证了batch_size一致性
             input_dict = {}
             modalities = ['rgb', 'depth', 'thermal', 'lidar', 'imu']
-            batch_size = len(batch['rgb']) if 'rgb' in batch and isinstance(batch['rgb'], torch.Tensor) else self.batch_size
 
+            # batch_size现在可以从任意模态获取，因为都是统一的
+            actual_batch_size = None
             for modality in modalities:
-                if modality in batch:
-                    if modality == 'lidar' and isinstance(batch[modality], list):
-                        # 处理列表形式的点云数据 - 统一尺寸后再批处理
-                        processed_lidar = []
-                        for lidar_points in batch[modality]:
-                            # 统一点云尺寸
-                            uniform_points = pad_or_subsample_pointcloud(lidar_points, target_size=16384)
-                            processed_lidar.append(uniform_points)
-                        input_dict[modality] = torch.stack(processed_lidar).to(self.device)
-                    elif isinstance(batch[modality], list):
-                        # 其他列表数据的处理
-                        try:
-                            input_dict[modality] = torch.stack(batch[modality]).to(self.device)
-                        except RuntimeError:
-                            # 如果无法stack，跳过该模态
-                            print(f"Warning: Skipping {modality} due to shape mismatch")
-                            continue
-                    else:
-                        # 正常的张量数据
-                        input_dict[modality] = batch[modality].to(self.device)
+                if modality in batch and len(batch[modality]) > 0:
+                    if isinstance(batch[modality], torch.Tensor):
+                        actual_batch_size = batch[modality].shape[0]
+                        break
+
+            if actual_batch_size is None:
+                actual_batch_size = self.batch_size
+                print(f"Warning: Cannot determine batch_size, using default {self.batch_size}")
+
+            # 直接传递collate后的数据和掩码
+            for modality in modalities:
+                if modality in batch and len(batch[modality]) > 0:
+                    # 路线B：所有数据已经在collate中处理为统一格式
+                    input_dict[modality] = batch[modality].to(self.device)
+
+            # 传递present_mask
+            if 'present_mask' in batch:
+                input_dict['present_mask'] = {}
+                for key, mask in batch['present_mask'].items():
+                    input_dict['present_mask'][key] = mask.to(self.device)
 
             # 生成模拟目标（实际训练中应使用真实标注）
-            pose_target = torch.randn(batch_size, 6, device=self.device) * 0.1
-            detection_targets = self._generate_mock_detection_targets(batch_size)
+            pose_target = torch.randn(actual_batch_size, 6, device=self.device) * 0.1
+            detection_targets = self._generate_mock_detection_targets(actual_batch_size)
 
-            with autocast(enabled=self.use_amp):
+            with autocast('cuda', enabled=self.use_amp):
                 # 前向传播
                 token_dict = self.encoder(input_dict)
                 moe_output = self.moe_fusion(token_dict)
@@ -579,8 +793,12 @@ class MineSLAMTrainer:
                     pose_target, detection_targets
                 )
 
-                # Kendall不确定性加权
-                weighted_losses = self.kendall_uncertainty(raw_losses)
+                # 修复版Kendall不确定性加权 - 使用新接口
+                weighted_losses = self.kendall_uncertainty.compute_multitask_loss(
+                    raw_losses['pose'],
+                    raw_losses['detection'],
+                    raw_losses['gate']
+                )
                 total_loss = weighted_losses['total_loss'] / self.accumulation_steps
 
             # 反向传播
@@ -618,7 +836,7 @@ class MineSLAMTrainer:
             # 记录训练指标
             if batch_idx % 50 == 0:
                 elapsed_time = time.time() - start_time
-                fps = (batch_idx + 1) * batch_size / elapsed_time
+                fps = (batch_idx + 1) * actual_batch_size / elapsed_time
                 gpu_memory = self._get_gpu_memory_usage()
                 kendall_weights = self.kendall_uncertainty.get_weights()
 
@@ -629,19 +847,83 @@ class MineSLAMTrainer:
                     'total': weighted_losses['total_loss'].item()
                 }
 
+                # 路线B：记录模态缺失统计
+                if 'present_mask' in batch:
+                    modality_stats = self._log_modality_statistics(batch['present_mask'])
+                else:
+                    modality_stats = "No mask data"
+
+                # 更新基础训练指标
                 self.metrics.update_train_metrics(
                     batch_losses, kendall_weights, gpu_memory, fps, epoch, global_step
                 )
 
+                # 更新SLAM详细指标（每100个batch执行一次）
+                if batch_idx % 100 == 0:
+                    # 构建模拟的ground truth用于演示
+                    mock_ground_truth = {
+                        'pose': pose_target,
+                        'detection': detection_targets
+                    }
+
+                    model_outputs_for_eval = {
+                        'pose': pose_pred,
+                        'detection': detection_pred,
+                        'moe_analysis': moe_output
+                    }
+
+                    self.metrics.update_slam_metrics(
+                        epoch, model_outputs_for_eval, mock_ground_truth, batch
+                    )
+
+                # 更新实时监控
+                if self.training_monitor:
+                    self.training_monitor.update_training_progress(
+                        epoch, batch_idx, batch_losses, kendall_weights, fps, gpu_memory
+                    )
+
                 print(f"Epoch {epoch}, Batch {batch_idx}/{len(self.train_loader)}: "
                       f"Loss={weighted_losses['total_loss'].item():.6f}, "
                       f"FPS={fps:.1f}, GPU={gpu_memory:.1f}MB")
+
+                # 每200个batch显示一次模态统计
+                if batch_idx % 200 == 0:
+                    print(f"  Modality presence: {modality_stats}")
+
+                # 生成实时可视化（每500个batch）
+                if batch_idx % 500 == 0 and batch_idx > 0 and self.visualizer:
+                    try:
+                        self.visualizer.plot_realtime_training(
+                            epoch, self.metrics.metrics_history,
+                            save_path=str(self.output_dir / 'visualizations' / f'training_progress_e{epoch}_b{batch_idx}.png')
+                        )
+                    except Exception as e:
+                        warnings.warn(f"Real-time visualization failed: {e}")
 
         # 平均损失
         for key in epoch_losses.keys():
             epoch_losses[key] /= num_batches
 
         return epoch_losses
+
+    def _log_modality_statistics(self, present_mask: Dict[str, torch.Tensor]) -> str:
+        """
+        记录模态缺失统计 - 路线B
+
+        Args:
+            present_mask: 掩码字典 {'rgb': [B], 'thermal': [B], 'lidar': [B], ...}
+
+        Returns:
+            str: 格式化的统计信息
+        """
+        stats = []
+        for modality, mask in present_mask.items():
+            if isinstance(mask, torch.Tensor):
+                present_rate = mask.float().mean().item()
+                missing_rate = 1.0 - present_rate
+                stats.append(f"{modality}:{missing_rate*100:.1f}%missing")
+
+        return ", ".join(stats)
 
     def _generate_mock_detection_targets(self, batch_size: int) -> List[Optional[Dict]]:
         """生成模拟检测目标"""
@@ -659,6 +941,15 @@ class MineSLAMTrainer:
 
     def validate(self, epoch: int) -> Tuple[float, float, float, float]:
         """验证模型性能"""
+        # 添加额外的警告过滤
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="MinkowskiEngine")
+            warnings.filterwarnings("ignore", category=FutureWarning, message=".*autocast.*")
+
+            return self._validate_impl(epoch)
+
+    def _validate_impl(self, epoch: int) -> Tuple[float, float, float, float]:
+        """验证模型性能的实际实现"""
         self.encoder.eval()
         self.moe_fusion.eval()
         self.pose_head.eval()
@@ -673,31 +964,31 @@ class MineSLAMTrainer:
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.val_loader):
-                # 构建输入
+                # 构建输入 - 路线B：直接使用collate的统一输出
                 input_dict = {}
                 modalities = ['rgb', 'depth', 'thermal', 'lidar', 'imu']
-                batch_size = len(batch['rgb']) if 'rgb' in batch and isinstance(batch['rgb'], torch.Tensor) else self.batch_size
 
+                # batch_size现在可以从任意模态获取，因为都是统一的
+                actual_batch_size = None
                 for modality in modalities:
-                    if modality in batch:
-                        if modality == 'lidar' and isinstance(batch[modality], list):
-                            # 处理列表形式的点云数据 - 统一尺寸后再批处理
-                            processed_lidar = []
-                            for lidar_points in batch[modality]:
-                                # 统一点云尺寸
-                                uniform_points = pad_or_subsample_pointcloud(lidar_points, target_size=16384)
-                                processed_lidar.append(uniform_points)
-                            input_dict[modality] = torch.stack(processed_lidar).to(self.device)
-                        elif isinstance(batch[modality], list):
-                            # 其他列表数据的处理
-                            try:
-                                input_dict[modality] = torch.stack(batch[modality]).to(self.device)
-                            except RuntimeError:
-                                # 如果无法stack，跳过该模态
-                                continue
-                        else:
-                            # 正常的张量数据
-                            input_dict[modality] = batch[modality].to(self.device)
+                    if modality in batch and len(batch[modality]) > 0:
+                        if isinstance(batch[modality], torch.Tensor):
+                            actual_batch_size = batch[modality].shape[0]
+                            break
+
+                if actual_batch_size is None:
+                    actual_batch_size = self.batch_size
+
+                # 直接传递collate后的数据和掩码
+                for modality in modalities:
+                    if modality in batch and len(batch[modality]) > 0:
+                        input_dict[modality] = batch[modality].to(self.device)
+
+                # 传递present_mask
+                if 'present_mask' in batch:
+                    input_dict['present_mask'] = {}
+                    for key, mask in batch['present_mask'].items():
+                        input_dict['present_mask'][key] = mask.to(self.device)
 
                 # 前向传播
                 token_dict = self.encoder(input_dict)
@@ -708,8 +999,8 @@ class MineSLAMTrainer:
                 detection_pred = self.detection_head(fused_tokens)
 
                 # 模拟验证损失计算（实际中应使用真实标注）
-                pose_target = torch.randn(batch_size, 6, device=self.device) * 0.1
-                detection_targets = self._generate_mock_detection_targets(batch_size)
+                pose_target = torch.randn(actual_batch_size, 6, device=self.device) * 0.1
+                detection_targets = self._generate_mock_detection_targets(actual_batch_size)
 
                 raw_losses = self._compute_multitask_loss(
                     moe_output, pose_pred, detection_pred,
@@ -784,8 +1075,35 @@ class MineSLAMTrainer:
             # 验证
             val_loss, ate, rpe, map_score = self.validate(epoch)
 
-            # 更新指标
+            # 更新基础验证指标
             self.metrics.update_val_metrics(val_loss, ate, rpe, map_score, epoch)
+
+            # 生成epoch可视化报告
+            if epoch % 5 == 0 and self.visualizer:  # 每5个epoch生成一次详细报告
+                try:
+                    # 生成轨迹可视化
+                    self.visualizer.plot_trajectory_comparison(
+                        predicted_trajectory=None,  # 在实际使用中需要传入真实轨迹
+                        ground_truth_trajectory=None,
+                        save_path=str(self.output_dir / 'visualizations' / f'trajectory_epoch_{epoch}.png')
+                    )
+
+                    # 生成训练进度综合报告
+                    self.visualizer.generate_training_report(
+                        metrics_history=self.metrics.metrics_history,
+                        slam_metrics=self.metrics.slam_metrics_history,
+                        epoch=epoch,
+                        output_dir=str(self.output_dir / 'reports')
+                    )
+
+                    # 生成Kendall权重分析图
+                    self.visualizer.plot_kendall_weight_evolution(
+                        kendall_history=self.metrics.metrics_history['kendall_weights'],
+                        save_path=str(self.output_dir / 'visualizations' / f'kendall_weights_epoch_{epoch}.png')
+                    )
+
+                except Exception as e:
+                    warnings.warn(f"Epoch visualization failed: {e}")
 
             # 检查是否达到目标
             target_reached = ate <= self.target_ate and map_score >= self.target_map
@@ -801,10 +1119,26 @@ class MineSLAMTrainer:
                   f"(pose={train_losses['pose']:.6f}, det={train_losses['detection']:.6f}, gate={train_losses['gate']:.6f})")
             print(f"  Val Metrics: Loss={val_loss:.6f}, ATE={ate:.3f}m, RPE={rpe:.3f}, mAP={map_score:.3f}")
 
-            # 显示Kendall权重
+            # 显示修复版Kendall权重状态
             kendall_weights = self.kendall_uncertainty.get_weights()
             print(f"  Kendall Weights: pose={kendall_weights['pose_weight']:.4f}, "
                   f"det={kendall_weights['detection_weight']:.4f}, gate={kendall_weights['gate_weight']:.4f}")
+
+            # 添加权重平衡监控
+            balance_metrics = self.kendall_uncertainty.get_weight_balance_metrics()
+            print(f"  Weight Balance: Score={balance_metrics['balance_score']:.3f}, "
+                  f"MaxRatio={balance_metrics['max_ratio']:.1f}:1")
+
+            # 检查权重失衡警告
+            if balance_metrics['max_ratio'] > 50:
+                print(f"  ⚠️ Warning: Severe weight imbalance detected!")
+                suggestions = self.kendall_uncertainty.get_optimization_suggestions()
+                for suggestion in suggestions.values():
+                    print(f"    - {suggestion}")
+
+            # 定期详细状态报告
+            if epoch % 5 == 0:
+                self.kendall_uncertainty.print_status(epoch)
 
             if target_reached:
                 print(f"🎯 Target reached! ATE={ate:.3f}≤{self.target_ate}, mAP={map_score:.3f}≥{self.target_map}")
@@ -814,8 +1148,8 @@ class MineSLAMTrainer:
                 print(f"⏹️ Early stopping triggered after {epoch+1} epochs")
                 break
 
-        # 保存最终指标
-        metrics_path = self.metrics.save_metrics()
+        # 保存最终指标（使用增强版）
+        metrics_path = self.metrics.save_enhanced_metrics()
         print(f"\n✅ Training completed! Metrics saved to: {metrics_path}")
         print(f"Best results: ATE={self.metrics.best_ate:.3f}m, mAP={self.metrics.best_map:.3f}, "
               f"Val Loss={self.metrics.best_val_loss:.6f}")

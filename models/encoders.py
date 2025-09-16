@@ -405,12 +405,12 @@ class LidarEncoder(nn.Module):
             
             # 体素化
             coords = pts[:, :3] / self.voxel_size
-            coords = coords.round().long()
-            
+            coords = coords.round().int()  # 修复：显式转换为int类型
+
             # 添加batch索引
-            batch_coords = torch.full((coords.shape[0], 1), b, 
-                                    dtype=coords.dtype, device=coords.device)
-            coords = torch.cat([batch_coords, coords], dim=1)
+            batch_coords = torch.full((coords.shape[0], 1), b,
+                                    dtype=torch.int32, device=coords.device)  # 修复：明确指定int32类型
+            coords = torch.cat([batch_coords, coords], dim=1)  # 现在coords是int类型
             
             # 使用强度作为特征
             features = pts[:, 3:4]  # [N, 1]
@@ -588,16 +588,17 @@ class MultiModalEncoder(nn.Module):
     
     def forward(self, data_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        前向传播
-        
+        前向传播，支持路线B掩码处理
+
         Args:
-            data_dict: 包含各模态数据的字典
+            data_dict: 包含各模态数据和掩码的字典
                 - 'rgb': [B, 3, H, W]
-                - 'depth': [B, 1, H, W] 
+                - 'depth': [B, 1, H, W]
                 - 'thermal': [B, 1, H, W]
-                - 'lidar': [B, N, 4]
+                - 'lidar': [B, P, 4]  # P=16384 固定长度
                 - 'imu': [B, T, 6]
-        
+                - 'present_mask': {'rgb': [B], 'thermal': [B], 'lidar': [B], ...}
+
         Returns:
             token_dict: 包含各模态token的字典
                 - 'rgb': [B, T_rgb, D]
@@ -607,23 +608,108 @@ class MultiModalEncoder(nn.Module):
                 - 'imu': [B, T_imu, D]
         """
         token_dict = {}
-        
+        present_mask = data_dict.get('present_mask', {})
+
         if 'rgb' in data_dict:
-            token_dict['rgb'] = self.rgb_encoder(data_dict['rgb'])
-        
+            mask = present_mask.get('rgb', None)
+            token_dict['rgb'] = self._forward_with_mask(
+                self.rgb_encoder, data_dict['rgb'], mask
+            )
+
         if 'depth' in data_dict:
-            token_dict['depth'] = self.depth_encoder(data_dict['depth'])
-        
+            mask = present_mask.get('depth', None)
+            token_dict['depth'] = self._forward_with_mask(
+                self.depth_encoder, data_dict['depth'], mask
+            )
+
         if 'thermal' in data_dict:
-            token_dict['thermal'] = self.thermal_encoder(data_dict['thermal'])
-        
+            mask = present_mask.get('thermal', None)
+            token_dict['thermal'] = self._forward_with_mask(
+                self.thermal_encoder, data_dict['thermal'], mask
+            )
+
         if 'lidar' in data_dict:
-            token_dict['lidar'] = self.lidar_encoder(data_dict['lidar'])
-        
+            mask = present_mask.get('lidar', None)
+            token_dict['lidar'] = self._forward_lidar_with_mask(
+                data_dict['lidar'], mask
+            )
+
         if 'imu' in data_dict:
-            token_dict['imu'] = self.imu_encoder(data_dict['imu'])
-        
+            mask = present_mask.get('imu', None)
+            token_dict['imu'] = self._forward_with_mask(
+                self.imu_encoder, data_dict['imu'], mask
+            )
+
         return token_dict
+
+    def _forward_with_mask(self, encoder: nn.Module, x: torch.Tensor,
+                          mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        带掩码的前向传播（通用图像和IMU编码器）
+
+        Args:
+            encoder: 编码器模块
+            x: 输入数据 [B, ...]
+            mask: 掩码 [B]，True表示真实数据，False表示填充
+
+        Returns:
+            tokens: [B, T, D] 编码后的token，填充样本为零向量
+        """
+        batch_size = x.shape[0]
+
+        if mask is None:
+            # 没有掩码，正常处理
+            return encoder(x)
+
+        # 正常编码
+        tokens = encoder(x)  # [B, T, D]
+
+        # 应用掩码：填充样本置零
+        mask_expanded = mask.view(batch_size, 1, 1)  # [B, 1, 1]
+        tokens = tokens * mask_expanded.float()  # 广播乘法，填充样本变为零向量
+
+        return tokens
+
+    def _forward_lidar_with_mask(self, points: torch.Tensor,
+                                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        LiDAR编码器的掩码前向传播
+
+        Args:
+            points: [B, P, 4] 点云数据（可能包含填充的零点云）
+            mask: [B] 布尔掩码，True表示真实数据，False表示填充
+
+        Returns:
+            tokens: [B, 1, D] 编码后的token
+        """
+        batch_size = points.shape[0]
+
+        if mask is None:
+            # 没有掩码，正常处理
+            return self.lidar_encoder(points)
+
+        # 处理每个样本
+        output_tokens = []
+        for i in range(batch_size):
+            if mask[i]:
+                # 真实数据：正常处理
+                sample_points = points[i:i+1]  # [1, P, 4]
+                coords, features = self.lidar_encoder.voxelize_pointcloud(sample_points)
+
+                if coords.shape[0] > 0:
+                    sparse_tensor = ME.SparseTensor(features, coords)
+                    encoded = self.lidar_encoder.unet(sparse_tensor)
+                    pooled = self.lidar_encoder.global_pool(encoded)
+                    token = pooled.F.unsqueeze(1)  # [1, 1, D]
+                else:
+                    token = torch.zeros(1, 1, self.embedding_dim, device=points.device)
+            else:
+                # 填充数据：输出零向量
+                token = torch.zeros(1, 1, self.embedding_dim, device=points.device)
+
+            output_tokens.append(token)
+
+        return torch.cat(output_tokens, dim=0)  # [B, 1, D]
     
     def get_total_tokens(self, available_modalities: List[str]) -> int:
         """获取给定模态的总token数量"""
